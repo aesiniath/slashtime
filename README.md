@@ -4,6 +4,10 @@ This is **slashtime**, a small program which displays the time in various
 places. What differentiates it from other world clock programs is that
 Slashtime shows the offset from your current location, not from UTC.
 
+<p align="center">
+<img width=272 height=940 src="images/Screenshot.png">
+</p>
+
 # CONFIGURATION
 
 
@@ -47,6 +51,9 @@ If you just built it locally, then you can run it in-place:
 but ideally you would install to your user's directory
 
     $ cargo install --path .
+
+If you want the application to be available in your desktop's menus, copy the
+files in the _share/_ tree to _~/.local/share/_ or _~/usr/local/_.
 
 ## HISTORY
 

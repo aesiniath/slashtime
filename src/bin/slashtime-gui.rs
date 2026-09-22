@@ -441,7 +441,7 @@ fn colours(reading: &Reading) -> (egui::Color32, egui::Color32) {
 fn row(ui: &mut egui::Ui, reading: &Reading, icons: &Icons) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), ROW_HEIGHT),
-        egui::Sense::click(),
+        egui::Sense::click_and_drag(),
     );
 
     let (background, foreground) = colours(reading);
@@ -685,6 +685,26 @@ impl Slashtime {
 
                 for reading in &readings {
                     let response = row(ui, reading, icons);
+
+                    // With no decorations there is no header bar to grab,
+                    // so dragging the list is how the window is moved: hand
+                    // the drag to the compositor, which snaps and tiles it as
+                    // it would any other window. egui only calls it a drag
+                    // once the pointer has travelled too far to be a click, so
+                    // choosing a pivot still works.
+                    if response.drag_started() {
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+
+                        // The compositor keeps the pointer for the length of
+                        // the move, so the button release that ends it never
+                        // reaches us. Say so ourselves, or egui goes on
+                        // holding this row as the thing being dragged, and
+                        // since a press can only claim a row while no claim
+                        // stands, every second drag would do nothing.
+                        ui.ctx().stop_dragging();
+                        ui.ctx()
+                            .input_mut(|state| state.pointer = Default::default());
+                    }
 
                     // double clicking a row measures every offset from there
                     // instead, which is the whole point of the program.

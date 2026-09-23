@@ -139,18 +139,23 @@ fn local_zone() -> Option<tz::TimeZone> {
     find_zone(&name).ok()
 }
 
-// the path to the tzlist configuration file in the user's config directory,
-// which on Linux is $XDG_CONFIG_HOME or ~/.config.
-fn default_tzlist_file() -> PathBuf {
+// Get the path to one of our files in the user's config directory. On Linux
+// this is $XDG_CONFIG_HOME (which defaults to ~/.config). On other operating
+// systems your best course of action is to consult tea leaves.
+pub fn config_file(name: &str) -> PathBuf {
     let mut path = dirs::config_dir().expect("unable to determine the user's config directory");
     path.push("slashtime");
-    path.push("tzlist");
+    path.push(name);
     path
 }
 
-// parse a file containing three tab separated columns: first with a IANA zone
-// info name, second city name, third country name. Ignore lines beginning
-// with # as comments
+fn default_tzlist_file() -> PathBuf {
+    config_file("tzlist")
+}
+
+// Parse a file containing three tab separated columns: first with a IANA zone
+// info name, second city name, third country name. Ignore blank lines and
+// lines beginning with `#` as comments
 fn tzinfo_parser(filename: &Path) -> Result<Vec<Place>, csv::Error> {
     let file = File::open(filename)?;
     let mut rdr = ReaderBuilder::new()

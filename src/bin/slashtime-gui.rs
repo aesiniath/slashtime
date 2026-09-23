@@ -50,6 +50,9 @@ const LARGEST: f32 = 4.0;
 // the change looks the same whether the window is small or large.
 const STEPS: f32 = 32.0;
 
+// filename for application settings
+const CONFIG: &str = "config";
+
 const VALUE_SIZE: f32 = 14.7;
 const CAPTION_SIZE: f32 = 9.5;
 const EDGE: f32 = 4.0;
@@ -575,6 +578,45 @@ fn height(locations: &[Locality]) -> f32 {
     locations.len() as f32 * ROW_HEIGHT + 2.0
 }
 
+// the scale the window was last left at. A first run has no file, which is
+// not a problem to report.
+fn remembered() -> f32 {
+    match std::fs::read_to_string(slashtime::loading::config_file(CONFIG)) {
+        Ok(text) => scale_in(&text),
+        Err(_) => 1.0,
+    }
+}
+
+// What a config file says the scale is, and 1 if it does not say. The file is
+// there to be edited by hand, so anything it says that a window could not be
+// drawn at is brought back to something that can be.
+fn scale_in(text: &str) -> f32 {
+    text.lines()
+        .filter_map(|line| line.split_once('='))
+        .find(|(key, _)| key.trim() == "scale")
+        .and_then(|(_, value)| value.trim().parse::<f32>().ok())
+        .filter(|scale| scale.is_finite())
+        .map_or(1.0, |scale| scale.clamp(SMALLEST, LARGEST))
+}
+
+// and keeping it there, which is a convenience rather than anything to stop
+// for if the directory cannot be written
+#[cfg(not(test))]
+fn remember(scale: f32) {
+    let path = slashtime::loading::config_file(CONFIG);
+
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let _ = std::fs::write(path, format!("scale = {}\n", scale));
+}
+
+// the tests drive the same keys, and must not reach into the user's own
+// config directory to do it
+#[cfg(test)]
+fn remember(_scale: f32) {}
+
 struct Slashtime {
     locations: Vec<Locality>,
     pivot: usize,
@@ -584,14 +626,18 @@ struct Slashtime {
 
     // the factor the window's size was last set for
     asked: f32,
+
+    // and the one written to the config file
+    saved: f32,
 }
 
 impl Slashtime {
-    fn new(ctx: &egui::Context, locations: Vec<Locality>, pivot: usize) -> Self {
+    fn new(ctx: &egui::Context, locations: Vec<Locality>, pivot: usize, scale: f32) -> Self {
         install_fonts(ctx, &locations);
 
         // otherwise egui acts on the same keys as resize(), and both apply
         ctx.options_mut(|options| options.zoom_with_keyboard = false);
+        ctx.set_zoom_factor(scale);
 
         Slashtime {
             locations,
@@ -599,7 +645,8 @@ impl Slashtime {
             icons: Icons::load(ctx),
             meeting: None,
             selected: Vec::new(),
-            asked: ctx.zoom_factor(),
+            asked: scale,
+            saved: scale,
         }
     }
 
@@ -644,13 +691,14 @@ impl Slashtime {
     fn resize(&mut self, ctx: &egui::Context) {
         // Counted, not merely tested, so that a key held down moves by every
         // repeat the system sends rather than by one a frame.
-        let (moves, back) = ctx.input(|state| {
+        let (moves, back, held) = ctx.input(|state| {
             let held = state.modifiers.command;
             let count = |key| if held { state.num_presses(key) } else { 0 } as i32;
 
             (
                 count(egui::Key::Plus) + count(egui::Key::Equals) - count(egui::Key::Minus),
                 held && state.key_pressed(egui::Key::Num0),
+                held,
             )
         });
 
@@ -666,6 +714,13 @@ impl Slashtime {
 
         if wanted != zoom {
             ctx.set_zoom_factor(wanted);
+        }
+
+        // Letting go of Ctrl is the end of the adjusting, so a run of presses
+        // comes to one write rather than thirty a second.
+        if !held && wanted != self.saved {
+            self.saved = wanted;
+            remember(wanted);
         }
 
         // Asked for once each time the factor moves. Comparing with the size
@@ -916,6 +971,7 @@ fn main() -> eframe::Result {
         )
         .get_matches();
 
+    let scale = remembered();
     let places = matches.get_one::<PathBuf>("places");
     let now = UtcDateTime::now().expect("system clock");
     let locations = slashtime::loading::load_tzlist(places.map(PathBuf::as_path), None, &now)
@@ -940,8 +996,9 @@ fn main() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            // sized to the list; there is nothing to scroll if it all fits
-            .with_inner_size([WIDTH, height(&locations)])
+            // sized to the list at the scale it was left at; there is nothing
+            // to scroll if it all fits
+            .with_inner_size([WIDTH * scale, height(&locations) * scale])
             // no decorations: the thin border around the list is the whole
             // frame, and it is the frame that turns red during a meeting.
             .with_decorations(false)
@@ -956,7 +1013,14 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "slashtime",
         options,
-        Box::new(|cc| Ok(Box::new(Slashtime::new(&cc.egui_ctx, locations, pivot)))),
+        Box::new(move |cc| {
+            Ok(Box::new(Slashtime::new(
+                &cc.egui_ctx,
+                locations,
+                pivot,
+                scale,
+            )))
+        }),
     )
 }
 
@@ -999,7 +1063,12 @@ mod tests {
                 move |ui, state: &mut Option<Slashtime>| {
                     state
                         .get_or_insert_with(|| {
-                            Slashtime::new(ui.ctx(), places.clone(), find_local(&places).unwrap())
+                            Slashtime::new(
+                                ui.ctx(),
+                                places.clone(),
+                                find_local(&places).unwrap(),
+                                1.0,
+                            )
                         })
                         .draw(ui);
                 },
@@ -1398,6 +1467,22 @@ mod tests {
 
         assert_eq!(app(&harness).pivot, 1, "the pivot did not move");
         assert_eq!(after, vec![0, 1, 2, 3], "the selection moved");
+    }
+
+    #[test]
+    fn a_config_file_says_what_scale_to_start_at() {
+        assert_eq!(scale_in("scale = 1.25\n"), 1.25);
+        assert_eq!(scale_in("scale=1.25"), 1.25, "spaces are not required");
+
+        assert_eq!(scale_in(""), 1.0, "an empty file");
+        assert_eq!(scale_in("colour = red\n"), 1.0, "nothing about the scale");
+        assert_eq!(scale_in("scale = wide\n"), 1.0, "not a number");
+        assert_eq!(scale_in("scale = NaN\n"), 1.0, "not a number either");
+
+        // the file is meant to be edited by hand, and a window drawn at forty
+        // times the size could not be got back again
+        assert_eq!(scale_in("scale = 40\n"), LARGEST, "beyond the largest");
+        assert_eq!(scale_in("scale = 0.01\n"), SMALLEST, "beyond the smallest");
     }
 
     #[test]

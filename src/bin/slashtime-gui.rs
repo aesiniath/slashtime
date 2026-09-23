@@ -41,6 +41,15 @@ const APP_ID: &str = "org.aesiniath.Slashtime";
 // an aspect ratio of approximately 7:1 given a list of 20 or so cities.
 const WIDTH: f32 = 272.0;
 
+// the limits of the zoom factor: where the caption stops being legible, and
+// where the 48 pixel icons start to soften.
+const SMALLEST: f32 = 0.5;
+const LARGEST: f32 = 4.0;
+
+// how many presses double the size. A press multiplies rather than adds, so
+// the change looks the same whether the window is small or large.
+const STEPS: f32 = 32.0;
+
 const VALUE_SIZE: f32 = 14.7;
 const CAPTION_SIZE: f32 = 9.5;
 const EDGE: f32 = 4.0;
@@ -561,17 +570,28 @@ fn row(ui: &mut egui::Ui, reading: &Reading, icons: &Icons) -> egui::Response {
     response
 }
 
+// every row of the list, and the point of frame above and below it
+fn height(locations: &[Locality]) -> f32 {
+    locations.len() as f32 * ROW_HEIGHT + 2.0
+}
+
 struct Slashtime {
     locations: Vec<Locality>,
     pivot: usize,
     icons: Icons,
     meeting: Option<Meeting>,
     selected: Vec<usize>,
+
+    // the factor the window's size was last set for
+    asked: f32,
 }
 
 impl Slashtime {
     fn new(ctx: &egui::Context, locations: Vec<Locality>, pivot: usize) -> Self {
         install_fonts(ctx, &locations);
+
+        // otherwise egui acts on the same keys as resize(), and both apply
+        ctx.options_mut(|options| options.zoom_with_keyboard = false);
 
         Slashtime {
             locations,
@@ -579,6 +599,7 @@ impl Slashtime {
             icons: Icons::load(ctx),
             meeting: None,
             selected: Vec::new(),
+            asked: ctx.zoom_factor(),
         }
     }
 
@@ -617,9 +638,54 @@ impl eframe::App for Slashtime {
 }
 
 impl Slashtime {
+    // Ctrl with plus and minus makes everything larger and smaller, and with
+    // zero puts it back. The layout is all in points, so the zoom factor alone
+    // does it; the window is then told the size the list has become.
+    fn resize(&mut self, ctx: &egui::Context) {
+        // Counted, not merely tested, so that a key held down moves by every
+        // repeat the system sends rather than by one a frame.
+        let (moves, back) = ctx.input(|state| {
+            let held = state.modifiers.command;
+            let count = |key| if held { state.num_presses(key) } else { 0 } as i32;
+
+            (
+                count(egui::Key::Plus) + count(egui::Key::Equals) - count(egui::Key::Minus),
+                held && state.key_pressed(egui::Key::Num0),
+            )
+        });
+
+        let zoom = ctx.zoom_factor();
+
+        let wanted = if back {
+            1.0
+        } else if moves != 0 {
+            (zoom * (moves as f32 / STEPS).exp2()).clamp(SMALLEST, LARGEST)
+        } else {
+            zoom
+        };
+
+        if wanted != zoom {
+            ctx.set_zoom_factor(wanted);
+        }
+
+        // Asked for once each time the factor moves. Comparing with the size
+        // the window took would never agree: at a fractional scale the
+        // compositor settles a pixel away from whatever it is asked for.
+        if zoom != self.asked {
+            self.asked = zoom;
+
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                WIDTH,
+                height(&self.locations),
+            )));
+        }
+    }
+
     // The whole of the drawing, separated from the App trait so that it can be
     // driven by a test harness, which has a Ui but no eframe::Frame.
     pub fn draw(&mut self, ui: &mut egui::Ui) {
+        self.resize(ui.ctx());
+
         let now = UtcDateTime::now().expect("system clock");
 
         // While a meeting is being planned the list shows that instant rather
@@ -872,16 +938,16 @@ fn main() -> eframe::Result {
         None => find_local(&locations).unwrap_or(0),
     };
 
-    // size the window to the list; there is nothing to scroll if it all fits
-    let height = locations.len() as f32 * ROW_HEIGHT + 2.0;
-
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([WIDTH, height])
+            // sized to the list; there is nothing to scroll if it all fits
+            .with_inner_size([WIDTH, height(&locations)])
             // no decorations: the thin border around the list is the whole
             // frame, and it is the frame that turns red during a meeting.
             .with_decorations(false)
-            .with_resizable(false)
+            // resizable only so that winit does not pin the size and clamp
+            // away what the zoom keys ask for
+            .with_resizable(true)
             .with_icon(marble())
             .with_app_id(APP_ID),
         ..Default::default()
@@ -1332,6 +1398,75 @@ mod tests {
 
         assert_eq!(app(&harness).pivot, 1, "the pivot did not move");
         assert_eq!(after, vec![0, 1, 2, 3], "the selection moved");
+    }
+
+    #[test]
+    fn the_zoom_keys_move_a_step_at_a_time() {
+        let mut harness = new_harness();
+        let ctx = harness.ctx.clone();
+        let ratio = (1.0f32 / STEPS).exp2();
+
+        assert_eq!(ctx.zoom_factor(), 1.0);
+
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Equals);
+        harness.run();
+        assert_eq!(ctx.zoom_factor(), ratio, "Ctrl+= did not enlarge");
+
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Minus);
+        harness.run();
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Minus);
+        harness.run();
+        assert!(
+            (ctx.zoom_factor() - 1.0 / ratio).abs() < 1e-6,
+            "Ctrl+- did not reduce"
+        );
+    }
+
+    // Multiplying by a ratio and dividing by it again does not always come
+    // back to where it started, so Ctrl+0 assigns 1 rather than undoing the
+    // arithmetic.
+    #[test]
+    fn ctrl_zero_returns_exactly_to_one() {
+        let mut harness = new_harness();
+        let ctx = harness.ctx.clone();
+
+        for key in [
+            egui::Key::Plus,
+            egui::Key::Plus,
+            egui::Key::Minus,
+            egui::Key::Plus,
+            egui::Key::Minus,
+            egui::Key::Minus,
+            egui::Key::Plus,
+        ] {
+            harness.key_press_modifiers(egui::Modifiers::COMMAND, key);
+            harness.run();
+        }
+
+        assert_ne!(ctx.zoom_factor(), 1.0, "the wandering came back on its own");
+
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Num0);
+        harness.run();
+
+        assert_eq!(ctx.zoom_factor(), 1.0, "Ctrl+0 did not land exactly on one");
+    }
+
+    #[test]
+    fn the_zoom_keys_stop_at_the_ends() {
+        let mut harness = new_harness();
+        let ctx = harness.ctx.clone();
+
+        for _ in 0..40 {
+            harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Minus);
+            harness.run();
+        }
+        assert_eq!(ctx.zoom_factor(), SMALLEST, "it went past the smallest");
+
+        for _ in 0..100 {
+            harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Plus);
+            harness.run();
+        }
+        assert_eq!(ctx.zoom_factor(), LARGEST, "it went past the largest");
     }
 
     #[test]

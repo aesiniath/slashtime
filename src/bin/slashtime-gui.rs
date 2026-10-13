@@ -181,7 +181,7 @@ fn fallback_fonts(locations: &[Locality]) -> Vec<(String, egui::FontData)> {
 
     for script in scripts {
         let key = fontique::FallbackKey::new(
-            fontique::Script::from_str_unchecked(script.short_name()),
+            fontique::Script::from_bytes(script.as_iso15924_tag().to_be_bytes()),
             None,
         );
         let Some(id) = collection.fallback_families(key).next() else {
